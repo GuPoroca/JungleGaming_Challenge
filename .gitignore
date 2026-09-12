@@ -1,0 +1,25 @@
+# Build artifacts
+/jungle-gaming-challenge
+/bin/
+/dist/
+*.exe
+
+# Go
+*.test
+*.out
+vendor/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local infra state
+deploy/localstack/.localstack/
+deploy/keycloak/data/
