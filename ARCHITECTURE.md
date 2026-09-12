@@ -150,6 +150,63 @@ rather than speculated about.
   reversals against the same reference — a repository concern, not
   something this package can check on a single already-loaded value.
 
+## Persistence schema (`migrations/`)
+
+- **Tool**: [golang-migrate](https://github.com/golang-migrate/migrate),
+  run through a `migrate` service in `docker-compose.yml` (the official
+  `migrate/migrate` image, `tools` profile) — no local install required.
+  `up`/`down` are both scripted and were both actually run against a real
+  Postgres container to confirm they work, not just written and assumed
+  correct.
+- **One migration so far** (`000001_init_financial_schema`) covering the
+  three aggregates that exist in Go: `wallets`, `wager_transactions`,
+  `wallet_ledger_entries`. No inbox/outbox tables yet — those domain
+  types don't exist, and a table with no corresponding Go type is just
+  dead schema.
+- **IDs are always application-supplied** (`UUID PRIMARY KEY`, no
+  `DEFAULT gen_random_uuid()`), matching the Go constructors, which take
+  an id as a parameter rather than generating one internally.
+- **Every domain invariant already enforced in Go is mirrored as a
+  database constraint**, per §5.8's requirement that non-negativity,
+  uniqueness, and ledger immutability be enforced by the schema itself,
+  not only by application code that could have a bug or simply not be
+  the only writer:
+  - `wallets`: `balance_minor_units >= 0`, `version >= 1`,
+    `UNIQUE (player_id, currency)`.
+  - `wager_transactions`: a `CHECK` per §7's amount rule (`LOSS` = 0,
+    everything else > 0); a `CHECK` mirroring `validateFieldsForKind`
+    (OPENING carries none of the external metadata, every other kind
+    carries all of it); a `CHECK` requiring a reference exactly for
+    `REFUND`/`ROLLBACK`; a `CHECK` requiring `PROCESSED` to carry a
+    `resulting_balance` and `REJECTED`/`FAILED` to carry a
+    `failure_code`; `UNIQUE (provider_id, external_transaction_id)`;
+    `UNIQUE (provider_id, idempotency_key)`; and a partial unique index
+    (`WHERE kind = 'OPENING'`) capping a wallet at one `OPENING` row.
+  - `wallet_ledger_entries`: a `CHECK` enforcing
+    `balanceAfter = balanceBefore ± amount` per `direction`, and
+    `UNIQUE (wallet_id, transaction_id)`.
+- **Two triggers add protection Go alone can't provide**, because they
+  guard against *any* writer, not just the application's own code path:
+  - `trg_wagertx_terminal_immutable` rejects any `UPDATE` on a
+    `wager_transactions` row already in a terminal state
+    (`PROCESSED`/`REJECTED`/`FAILED`) — the same rule
+    `WagerTransaction.MarkX` already enforces in Go, now also true even
+    if a bug or a direct SQL statement bypasses the domain layer.
+  - `trg_ledger_immutable` rejects any `UPDATE` or `DELETE` at all on
+    `wallet_ledger_entries` — the ledger is append-only, enforced as a
+    hard database rule rather than by convention.
+  - Both were verified with real `UPDATE`/`DELETE`/`INSERT` statements
+    against a running Postgres, not just written and trusted: a negative
+    balance, a duplicate wallet, a `BET` missing external metadata, a
+    ledger row with the wrong `balanceAfter` for its direction, editing
+    or deleting a ledger row, and re-transitioning a terminal transaction
+    were all attempted and all rejected.
+- **Not yet decided**: the concurrency-control mechanism (pessimistic
+  lock vs. optimistic CAS) touches these tables but isn't implemented
+  yet — no repository code exists to attach it to. `wallets.version`
+  exists specifically so either approach can use it once that layer is
+  built.
+
 ## Go module
 
 - Module path: `github.com/gustavoporoca/jungle-gaming-challenge`.
@@ -177,5 +234,6 @@ rather than speculated about.
 - Uber Fx composition beyond the minimal lifecycle bootstrap in `main.go`.
 - Graceful shutdown behavior for HTTP, the SQS consumer, and the outbox
   publisher.
-- Persistence: PostgreSQL schema, migrations, `pgx` repositories.
+- `pgx` repositories over the schema in `migrations/` (the schema itself
+  is done — see Persistence schema above).
 - HTTP and SQS transport.
