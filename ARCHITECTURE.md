@@ -54,12 +54,21 @@ rather than speculated about.
 - **Version** starts at 1 on creation and increments by exactly 1 on every
   *successful* `Debit`/`Credit`. A failed call returns zero values and
   leaves the receiver untouched (Go value semantics, not extra code).
-- **Concurrency strategy**: not yet decided in code — `version` exists to
-  support either pessimistic locking (`SELECT ... FOR UPDATE`) or
-  optimistic compare-and-swap (`UPDATE ... WHERE version = $1`) once the
-  repository layer is built. Leaning pessimistic (simpler to reason about
-  for this domain, avoids a retry loop), but this isn't final until the
-  repository exists.
+- **Concurrency strategy: pessimistic locking, decided and verified.**
+  `WalletRepository.FindByIDForUpdate` takes `SELECT ... FOR UPDATE`
+  inside a transaction before any read the operation depends on; a
+  concurrent operation against the *same* wallet blocks on that `SELECT`
+  until the first transaction commits or rolls back, so the two can never
+  race on the later `UPDATE`. Different wallets are different rows, so
+  they never contend — locking is per-row, not global. This was chosen
+  over optimistic compare-and-swap (`UPDATE ... WHERE version = $1`
+  with a retry loop) because a debit's SQL transaction also has to write
+  a ledger entry and update the triggering `WagerTransaction`'s state in
+  the same commit; retrying a version conflict would mean re-doing all
+  three, whereas locking the wallet row up front means there's nothing to
+  retry at all. See "Persistence: pgx layer" below for how this is
+  actually exercised against a real database, including the §8-mandated
+  concurrent-debit scenario.
 
 ## Ledger (`internal/domain/ledger`)
 
@@ -201,25 +210,117 @@ rather than speculated about.
     ledger row with the wrong `balanceAfter` for its direction, editing
     or deleting a ledger row, and re-transitioning a terminal transaction
     were all attempted and all rejected.
-- **Not yet decided**: the concurrency-control mechanism (pessimistic
-  lock vs. optimistic CAS) touches these tables but isn't implemented
-  yet — no repository code exists to attach it to. `wallets.version`
-  exists specifically so either approach can use it once that layer is
-  built.
+## Persistence: pgx layer (`internal/platform/postgres`)
+
+- **Library**: `pgx/v5` with explicit SQL (no `sqlc`, no ORM) — every
+  query in this package is hand-written and visible, so the transaction
+  boundary and the exact columns touched are never hidden behind
+  generated code.
+- **`Querier` interface** (`Exec`/`Query`/`QueryRow`) is satisfied by
+  both `*pgxpool.Pool` and `pgx.Tx`. Every repository method takes a
+  `Querier` rather than a concrete type, so *the caller* decides the
+  transaction boundary by choosing what to pass — the pool for one
+  read, an active `pgx.Tx` (via the `WithTx` helper) when several
+  repository calls must commit or roll back together. `WalletRepository`
+  and `WagerTransactionRepository` both follow this shape; a ledger
+  repository (still pending) will too.
+- **No repository interface (port) is defined yet.** `internal/app`,
+  which will own that interface, doesn't exist yet either. Defining an
+  interface before its only consumer exists would mean guessing its
+  shape; `WalletRepository`/`WagerTransactionRepository` are concrete
+  structs today, and Go's structural typing means either can satisfy
+  whatever interface `internal/app` ends up declaring once it exists,
+  with no changes needed here.
+- **`WagerTransactionRepository`** covers `Create`, `FindByID`,
+  `FindByIDForUpdate`, `FindByProviderAndExternalID` (the §7 reference
+  lookup and the idempotent-replay-by-business-key path),
+  `FindByProviderAndIdempotencyKey` (the `Idempotency-Key` header lookup
+  path), and `Update` (state transitions). `Create` classifies Postgres
+  errors into `ErrTransactionAlreadyExists` (any of the table's three
+  uniqueness rules — see the schema section above) and `ErrWalletNotFound`
+  (the FK to `wallets`), so the use-case layer never has to inspect a raw
+  `pgconn.PgError` itself.
+- **The terminal-transition trigger was deliberately left unmapped.**
+  `Update`'s doc comment is explicit that a rejection from
+  `trg_wagertx_terminal_immutable` propagates as a raw Postgres error
+  rather than being translated into `wagertransaction.ErrTerminalTransaction`
+  — correct application code is expected to check `State().IsTerminal()`
+  in Go before ever calling `Update`, so hitting the trigger at all means
+  something already went wrong upstream; it's a safety net, not a
+  documented code path the use-case layer is meant to branch on.
+  `TestWagerTransactionRepository_Update_TerminalRowRejectedByTrigger`
+  confirms the trigger actually fires, not that the Go layer alone is
+  trusted to prevent it.
+- **`LedgerRepository` exposes no `Update` or `Delete` at all** — not
+  just "the schema rejects it," but there is no method here that could
+  even attempt one. `Create` classifies the same way the other two
+  repositories do: a uniqueness violation on `(walletId, transactionId)`
+  becomes `ErrLedgerEntryAlreadyExists` (the schema's last line of
+  defense against ever recording two movements for one transaction), and
+  a foreign key violation is disambiguated by constraint name into
+  `ErrWalletNotFound` or `ErrTransactionNotFound` — the first repository
+  where two different FKs on one table needed telling apart, so `Create`
+  inspects `pgErr.ConstraintName` rather than just checking the
+  SQLSTATE.
+- **`FindByWalletID` implements the ledger's cursor pagination as keyset
+  pagination** on `(created_at, id)`, using the index built for exactly
+  this (`idx_ledger_wallet_pagination`). It fetches `limit+1` rows to
+  determine whether another page exists, then trims to `limit`. The
+  returned `LedgerCursor` is a typed Go value `{CreatedAt, ID}`, not yet
+  an opaque wire string — turning it into and out of the HTTP query
+  param's opaque cursor is deliberately left to the HTTP layer (not
+  built yet), since encoding is a transport concern, not a query
+  concern. Order is oldest-first, matching how a bank statement reads.
+- **`SumBalanceByWallet` is what the reconciliation endpoint will call**:
+  credits minus debits over every entry for a wallet, plus the count for
+  the response's `checkedEntries`. `currency` is a parameter rather than
+  inferred from the rows because a wallet with a zero initial balance
+  has no entries at all to infer it from.
+- **IDs bind as plain Go `string`** against `uuid` columns — pgx's
+  built-in `uuid` codec accepts and returns canonical text form, so no
+  `pgtype.UUID` wrapper is needed to match the domain's string-based
+  `wallet.ID`/`wallet.PlayerID` types.
+- **Money round-trips through `MinorUnits()`/`FromMinorUnits`**, added to
+  the `money` package specifically for this: `Money` had a constructor
+  *from* raw minor units but no accessor to get them back out for a
+  `BIGINT` column, which persistence obviously needs.
+- **Integration tests are real, not mocked**, gated behind a
+  `//go:build integration` tag (documented in
+  `internal/platform/postgres/wallet_repository_test.go`) so
+  `go test ./...` stays fast and infra-free, while
+  `go test -tags=integration -race ./internal/platform/postgres/...`
+  exercises an actual Postgres started via `docker compose up -d postgres`
+  with the migration already applied.
+- **The §8-mandated concurrency test is already passing for real**: a
+  wallet with 100.00 BRL, two goroutines each opening their own
+  transaction and racing to debit 80.00 BRL via `FindByIDForUpdate` +
+  `Update`. Verified outcome: exactly one succeeds, the other fails with
+  `wallet.ErrInsufficientBalance`, final balance is 20.00, and the
+  version advances by exactly 1 (proving only one debit actually landed,
+  not that both landed and something else masked it). This is a genuine
+  row-lock-driven serialization, not a mock standing in for one.
 
 ## Go module
 
 - Module path: `github.com/gustavoporoca/jungle-gaming-challenge`.
-- `go.mod` pins `go 1.23` rather than the exact local toolchain version, so
-  the declared version stays portable across machines and the eventual
-  Docker build.
+- `go.mod`'s `go` directive has been bumped by tooling as dependencies
+  were added (`1.23` → `1.25.0`, when `pgx/v5` was introduced) rather
+  than pinned by hand — `go get`/`go mod tidy` raise it to the minimum
+  the resolved dependency graph actually requires. The Docker build will
+  need to use a matching `golang` base image tag once a Dockerfile
+  exists.
 
 ## Pending (not yet implemented)
 
-- Inbox / outbox (§6.5).
-- Idempotency (key handling, payload hashing, conflict detection).
-- The concurrency strategy above, once there's a repository to attach it
-  to.
+- All three repositories the domain needs now exist (`WalletRepository`,
+  `WagerTransactionRepository`, `LedgerRepository`). What's still missing
+  is the use-case layer that opens one transaction and calls all three
+  together — nothing wires them into a single unit of work yet.
+- Inbox / outbox (§6.5) — no tables, no domain types, no repository.
+- Idempotency (key handling, payload hashing, conflict detection). The
+  lookups it needs (`FindByProviderAndIdempotencyKey`,
+  `FindByProviderAndExternalID`) exist; the comparison-and-replay logic
+  that uses them does not.
 - Resolving a reversal's reference by querying storage — the domain layer
   only validates agreement once both sides are already loaded (see
   `ValidateReversalAgreement` above); looking the reference up by
@@ -233,7 +334,6 @@ rather than speculated about.
 - Authentication / authorization (OIDC via Keycloak).
 - Uber Fx composition beyond the minimal lifecycle bootstrap in `main.go`.
 - Graceful shutdown behavior for HTTP, the SQS consumer, and the outbox
-  publisher.
-- `pgx` repositories over the schema in `migrations/` (the schema itself
-  is done — see Persistence schema above).
+  publisher. Wiring `NewPool` and the three repositories into the Fx app
+  itself is also still pending — they exist as plain constructors today.
 - HTTP and SQS transport.

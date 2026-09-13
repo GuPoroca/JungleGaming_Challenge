@@ -16,6 +16,20 @@ func mustParse(t *testing.T, amount, currency string) Money {
 	return m
 }
 
+func TestMinorUnits_RoundTrip(t *testing.T) {
+	original := mustParse(t, "1234.56", "BRL")
+	reconstructed, err := FromMinorUnits(original.MinorUnits(), original.Currency())
+	if err != nil {
+		t.Fatalf("FromMinorUnits unexpected error: %v", err)
+	}
+	if reconstructed != original {
+		t.Errorf("round trip = %+v, want %+v", reconstructed, original)
+	}
+	if original.MinorUnits() != 123456 {
+		t.Errorf("MinorUnits() = %d, want 123456", original.MinorUnits())
+	}
+}
+
 func TestParse_Valid(t *testing.T) {
 	cases := []struct {
 		amount   string

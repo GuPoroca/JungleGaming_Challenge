@@ -189,6 +189,11 @@ func (m Money) IsPositive() bool { return m.minorUnits > 0 }
 // Currency returns the ISO 4217 currency code.
 func (m Money) Currency() string { return m.currency }
 
+// MinorUnits returns the raw int64 minor-unit value, for persisting it
+// exactly (e.g. into a BIGINT column) and reconstructing it later via
+// FromMinorUnits. It is the inverse of FromMinorUnits.
+func (m Money) MinorUnits() int64 { return m.minorUnits }
+
 // String formats the amount at a fixed scale of two decimal digits, e.g.
 // "25.00" or "-5.00". It does not include the currency code.
 func (m Money) String() string {
